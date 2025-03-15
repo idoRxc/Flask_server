@@ -7,49 +7,48 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 
 GO_VERSION="1.21.7"
-GO_URL="https://golang.org/dl/go${GO_VERSION}.linux-amd64.tar.gz"
 PYTHON_VERSION="3.9"
 INSTALL_DIR="$(pwd)"
 SERVER_DIR="$INSTALL_DIR/server"
 AGENT_DIR="$INSTALL_DIR/agent"
 PROXY_DIR="$INSTALL_DIR/proxy"
 FLASK_DIR="$INSTALL_DIR/flask_server"
+IMAGERY_DIR="$INSTALL_DIR/imagery_server"
 CERTS_DIR="$INSTALL_DIR/certs"
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-install_go() {
-    if command_exists go; then
-        echo -e "${GREEN}Go is already installed: $(go version)${NC}"
+install_docker() {
+    if command_exists docker; then
+        echo -e "${GREEN}Docker is already installed: $(docker --version)${NC}"
     else
-        echo "Installing Go $GO_VERSION..."
-        wget -q "$GO_URL" -O go.tar.gz
-        sudo tar -C /usr/local -xzf go.tar.gz
-        echo "export PATH=\$PATH:/usr/local/go/bin" >> ~/.bashrc
-        export PATH=$PATH:/usr/local/go/bin
-        rm go.tar.gz
-        if ! command_exists go; then
-            echo -e "${RED}Failed to install Go. Please install it manually.${NC}"
+        echo "Installing Docker..."
+        sudo apt-get update -q
+        sudo apt-get install -y docker.io
+        sudo systemctl enable docker
+        sudo systemctl start docker
+        if ! command_exists docker; then
+            echo -e "${RED}Failed to install Docker. Please install it manually.${NC}"
             exit 1
         fi
-        echo -e "${GREEN}Go installed: $(go version)${NC}"
+        echo -e "${GREEN}Docker installed${NC}"
     fi
 }
 
-install_python() {
-    if command_exists python3 && python3 --version | grep -q "Python $PYTHON_VERSION"; then
-        echo -e "${GREEN}Python $PYTHON_VERSION or higher is already installed: $(python3 --version)${NC}"
+install_docker_compose() {
+    if command_exists docker-compose; then
+        echo -e "${GREEN}Docker Compose is already installed: $(docker-compose --version)${NC}"
     else
-        echo "Installing Python $PYTHON_VERSION..."
-        sudo apt-get update -q
-        sudo apt-get install -y python3 python3-pip python3-dev
-        if ! command_exists python3; then
-            echo -e "${RED}Failed to install Python. Please install it manually.${NC}"
+        echo "Installing Docker Compose..."
+        sudo curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+        sudo chmod +x /usr/local/bin/docker-compose
+        if ! command_exists docker-compose; then
+            echo -e "${RED}Failed to install Docker Compose. Please install it manually.${NC}"
             exit 1
         fi
-        echo -e "${GREEN}Python installed: $(python3 --version)${NC}"
+        echo -e "${GREEN}Docker Compose installed${NC}"
     fi
 }
 
@@ -68,35 +67,12 @@ install_openssl() {
     fi
 }
 
-install_redis() {
-    if command_exists redis-server; then
-        echo -e "${GREEN}Redis is already installed: $(redis-server --version)${NC}"
-    else
-        echo "Installing Redis..."
-        sudo apt-get update -q
-        sudo apt-get install -y redis-server
-        if ! command_exists redis-server; then
-            echo -e "${RED}Failed to install Redis. Please install it manually.${NC}"
-            exit 1
-        fi
-        sudo systemctl enable redis-server
-        sudo systemctl start redis-server
-        echo -e "${GREEN}Redis installed and started${NC}"
-    fi
-}
-
-install_python_deps() {
-    echo "Installing Python dependencies..."
-    pip3 install --upgrade pip
-    pip3 install flask cryptography pyOpenSSL redis flask-limiter werkzeug marshmallow tenacity
-    echo -e "${GREEN}Python dependencies installed${NC}"
-}
-
 setup_directories() {
     echo "Setting up directories..."
-    mkdir -p "$SERVER_DIR" "$AGENT_DIR" "$PROXY_DIR" "$FLASK_DIR" "$CERTS_DIR"
-    mkdir -p "$SERVER_DIR/config" "$AGENT_DIR/config" "$PROXY_DIR/config" "$FLASK_DIR/config" "$FLASK_DIR/static"
-    mkdir -p "$SERVER_DIR/log" "$AGENT_DIR/log" "$PROXY_DIR/log" "$FLASK_DIR/log"
+    mkdir -p "$SERVER_DIR" "$AGENT_DIR" "$PROXY_DIR" "$FLASK_DIR" "$IMAGERY_DIR" "$CERTS_DIR"
+    mkdir -p "$SERVER_DIR/config" "$AGENT_DIR/config" "$PROXY_DIR/config" "$FLASK_DIR/config" "$IMAGERY_DIR/config"
+    mkdir -p "$SERVER_DIR/log" "$AGENT_DIR/log" "$PROXY_DIR/log" "$FLASK_DIR/log" "$IMAGERY_DIR/log"
+    mkdir -p "$FLASK_DIR/static" "$IMAGERY_DIR/imagery"
 }
 
 generate_certs() {
@@ -124,98 +100,187 @@ generate_certs() {
         openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out client.crt -days 365 -sha256
         rm client.csr
     fi
+    cp server.key imagery_server.key
+    cp server.crt imagery_server.crt
     chmod 600 *.key
     cd "$INSTALL_DIR"
     echo -e "${GREEN}Certificates generated${NC}"
 }
 
-generate_flask_env() {
-    echo "Generating Flask environment file..."
-    cat > "$FLASK_DIR/.env" << EOF
-SECRET_KEY=$(openssl rand -hex 32)
-REDIS_HOST=localhost
-REDIS_PORT=6379
-REDIS_DB=0
-REDIS_SSL=false
-PROXY_HOST=0.0.0.0
-PROXY_PORT=8443
-OSINT_SERVER_HOST=0.0.0.0
-OSINT_SERVER_PORT=8444
-CA_CERT_PATH=$CERTS_DIR/ca.crt
-CERT_PATH=$CERTS_DIR/client.crt
-KEY_PATH=$CERTS_DIR/client.key
-PORT=5000
-INITIALIZE_ADMIN=true
+generate_dockerfiles() {
+    echo "Generating Dockerfiles..."
+
+    # Dockerfile for OSINT Server
+    cat > "$SERVER_DIR/Dockerfile" << 'EOF'
+FROM golang:1.21.7-alpine
+WORKDIR /app
+COPY server.go .
+RUN go build -o server server.go
+CMD ["./server"]
+EXPOSE 8444
 EOF
-    echo -e "${GREEN}Flask environment file generated at $FLASK_DIR/.env${NC}"
+
+    # Dockerfile for OSINT Agent
+    cat > "$AGENT_DIR/Dockerfile" << 'EOF'
+FROM golang:1.21.7-alpine
+WORKDIR /app
+COPY agent.go .
+RUN go build -o agent agent.go
+CMD ["./agent"]
+EOF
+
+    # Dockerfile for MiddleProxy
+    cat > "$PROXY_DIR/Dockerfile" << 'EOF'
+FROM python:3.9-slim
+WORKDIR /app
+COPY proxy.py .
+RUN pip install cryptography pyOpenSSL
+CMD ["python", "proxy.py"]
+EXPOSE 8443
+EOF
+
+    # Dockerfile for Flask Server
+    cat > "$FLASK_DIR/Dockerfile" << 'EOF'
+FROM python:3.9-slim
+WORKDIR /app
+COPY flask_server.py .
+COPY static/ static/
+RUN pip install flask cryptography pyOpenSSL redis flask-limiter werkzeug marshmallow tenacity
+CMD ["python", "flask_server.py"]
+EXPOSE 5000
+EOF
+
+    # Dockerfile for Imagery Server
+    cat > "$IMAGERY_DIR/Dockerfile" << 'EOF'
+FROM python:3.9-slim
+WORKDIR /app
+COPY imagery_server.py .
+RUN pip install flask cryptography pyOpenSSL redis flask-limiter pillow numpy matplotlib torch torchvision marshmallow
+CMD ["python", "imagery_server.py"]
+EXPOSE 5001
+VOLUME /app/imagery
+EOF
 }
 
-copy_source_code() {
-    echo "Copying source code..."
-    if [ ! -f "$SERVER_DIR/server.go" ]; then
-        cat > "$SERVER_DIR/server.go" << 'EOF'
-package main
-import "log"
-func main() { log.Fatal("Server placeholder - replace with actual code") }
+generate_docker_compose() {
+    echo "Generating docker-compose.yml..."
+    cat > "$INSTALL_DIR/docker-compose.yml" << 'EOF'
+version: '3.8'
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  osint-server:
+    build: ./server
+    ports:
+      - "8444:8444"
+    volumes:
+      - ./certs:/app/certs
+    depends_on:
+      - redis
+
+  osint-agent:
+    build: ./agent
+    volumes:
+      - ./certs:/app/certs
+    depends_on:
+      - middleproxy
+
+  middleproxy:
+    build: ./proxy
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./certs:/app/certs
+    depends_on:
+      - osint-server
+
+  flask-server:
+    build: ./flask_server
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./certs:/app/certs
+      - ./flask_server/log:/app/log
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-$(openssl rand -hex 32)}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_SSL=false
+      - PROXY_HOST=middleproxy
+      - PROXY_PORT=8443
+      - OSINT_SERVER_HOST=osint-server
+      - OSINT_SERVER_PORT=8444
+      - CA_CERT_PATH=/app/certs/ca.crt
+      - CERT_PATH=/app/certs/client.crt
+      - KEY_PATH=/app/certs/client.key
+      - PORT=5000
+      - INITIALIZE_ADMIN=true
+    depends_on:
+      - redis
+      - middleproxy
+
+  imagery-server:
+    build: ./imagery_server
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./certs:/app/certs
+      - ./imagery_server/imagery:/app/imagery
+      - ./imagery_server/log:/app/log
+    environment:
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-$(openssl rand -hex 32)}
+      - SENTINEL_API_KEY=your_sentinel_hub_key
+      - API_TOKEN=your_jwt_token_from_flask_login
+      - CA_CERT_PATH=/app/certs/ca.crt
+      - WHITELISTED_IPS=flask-server
+      - IMAGERY_DIR=/app/imagery
+      - IMAGERY_SERVER_PORT=5001
+      - FLASK_SERVER_URL=http://flask-server:5000
+      - FLASK_ENV=production
+      - SSL_CERT_PATH=/app/certs/imagery_server.crt
+      - SSL_KEY_PATH=/app/certs/imagery_server.key
+    depends_on:
+      - flask-server
+
+volumes:
+  redis-data:
 EOF
-    fi
-    if [ ! -f "$AGENT_DIR/agent.go" ]; then
-        cat > "$AGENT_DIR/agent.go" << 'EOF'
-package main
-import "log"
-func main() { log.Fatal("Agent placeholder - replace with actual code") }
-EOF
-    fi
-    if [ ! -f "$PROXY_DIR/proxy.py" ]; then
-        cat > "$PROXY_DIR/proxy.py" << 'EOF'
-[Insert your MiddleProxy code here]
-EOF
-    fi
-    if [ ! -f "$FLASK_DIR/flask_server.py" ]; then
-        cat > "$FLASK_DIR/flask_server.py" << 'EOF'
-[Insert your Flask server code here]
-EOF
-    fi
-    if [ ! -f "$FLASK_DIR/static/index.html" ]; then
-        cat > "$FLASK_DIR/static/index.html" << 'EOF'
-<!DOCTYPE html>
-<html>
-<head><title>OSINT Dashboard</title></head>
-<body><h1>Welcome to OSINT Dashboard</h1></body>
-</html>
-EOF
-    fi
 }
 
-compile_go_programs() {
-    echo "Compiling Go programs..."
-    cd "$SERVER_DIR"
-    go build -o server server.go
-    cd "$AGENT_DIR"
-    go build -o agent agent.go
-    cd "$INSTALL_DIR"
-    echo -e "${GREEN}Go programs compiled${NC}"
+check_source_files() {
+    echo "Checking for required source files..."
+    for file in "$SERVER_DIR/server.go" "$AGENT_DIR/agent.go" "$PROXY_DIR/proxy.py" "$FLASK_DIR/flask_server.py" "$IMAGERY_DIR/imagery_server.py"; do
+        if [ ! -f "$file" ]; then
+            echo -e "${RED}Error: $file is missing. Please add your actual implementation before running this script.${NC}"
+            exit 1
+        fi
+    done
+    echo -e "${GREEN}All required source files found${NC}"
 }
 
 main() {
     echo "Starting setup..."
-    install_go
-    install_python
+    install_docker
+    install_docker_compose
     install_openssl
-    install_redis
-    install_python_deps
     setup_directories
     generate_certs
-    generate_flask_env
-    copy_source_code
-    compile_go_programs
+    check_source_files  # Ensure all source files are present
+    generate_dockerfiles
+    generate_docker_compose
+    echo "Building and starting Docker containers..."
+    docker-compose up --build -d
     echo -e "${GREEN}Setup complete!${NC}"
-    echo "To run the components:"
-    echo "  1. Start the OSINT Server: cd $SERVER_DIR && ./server config/server.yaml"
-    echo "  2. Start the OSINT Agent: cd $AGENT_DIR && ./agent config/agent.yaml"
-    echo "  3. Start the MiddleProxy: cd $PROXY_DIR && python3 proxy.py"
-    echo "  4. Start the Flask Server: cd $FLASK_DIR && source .env && python3 flask_server.py"
-    echo "Note: Ensure Redis is running (sudo systemctl start redis-server) and replace placeholder code with actual implementations."
+    echo "Containers are running. Check logs with:"
+    echo "  docker-compose logs [service_name] (e.g., flask-server, imagery-server)"
+    echo "To stop: docker-compose down"
+    echo "Note: Update SENTINEL_API_KEY and API_TOKEN in docker-compose.yml after Flask login."
 }
 
 main

@@ -418,10 +418,10 @@ class MiddleProxy:
             print(f"Error handling other traffic: {e}")
 
 if __name__ == '__main__':
-    LISTEN_HOST = '0.0.0.0'  # Host address where the proxy listens for incoming connections
-    LISTEN_PORT = 8443       # Port where the proxy listens for incoming connections
-    BACKEND_HOST = '192.168.1.100'  # Address of the actual backend server
-    BACKEND_PORT = 8444      # Port of the actual backend server
+    LISTEN_HOST = '0.0.0.0'  
+    LISTEN_PORT = 8443       
+    BACKEND_HOST = 'localhost' 
+    BACKEND_PORT = 8444     
 
     cert_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'certs')
     

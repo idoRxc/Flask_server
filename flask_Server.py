@@ -118,7 +118,7 @@ def init_redis():
             redis_client.hset('users', 'admin', json.dumps(admin_data))
             logging.info("Initialized default admin user")
         if not redis_client.exists('blocked_ips'):
-            redis_client.sadd('blocked_ips', '0.0.0.0')  # Example blocked IP
+            redis_client.sadd('blocked_ips', '0.0.0.0')  
     except ConnectionError as e:
         logging.error(f"Failed to connect to Redis: {str(e)}")
         raise

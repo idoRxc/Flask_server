@@ -293,7 +293,6 @@ def get_imagery(filename):
         logging.error(f"Imagery retrieval failed: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 404
 
-# --- Security Headers ---
 @app.after_request
 def add_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'

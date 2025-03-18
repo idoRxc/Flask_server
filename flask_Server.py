@@ -21,11 +21,15 @@ from flask import send_from_directory, abort
 from marshmallow import Schema, fields, ValidationError
 import ipaddress
 from tenacity import retry, stop_after_attempt, wait_fixed
- 
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import base64
 
 app = Flask(__name__)
 
-# Logging with IP and user context
+
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s - IP: %(ip)s - User: %(user)s',
@@ -142,29 +146,44 @@ class OSINTClient:
         with open(KEY_PATH, 'r') as f: self.key = f.read()
         with open(CA_CERT_PATH, 'r') as f: self.ca = f.read()
 
-    def send_command(self, command: str, args: Dict = None) -> Dict:
-        try:
-            with socket.create_connection((PROXY_HOST, PROXY_PORT), timeout=TIMEOUT) as sock:
-                with self.context.wrap_socket(sock, server_hostname=PROXY_HOST) as ssock:
-                    cert_data = {'cert': self.cert, 'key': self.key, 'ca': self.ca}
-                    ssock.send(json.dumps(cert_data).encode('utf-8'))
-                    salt = ssock.recv(4096)
-                    if not salt:
-                        raise OSINTClientError("Failed to receive encryption salt from proxy")
-                    cmd = {"command": command}
-                    if args:
-                        cmd["args"] = args
-                    ssock.send(json.dumps(cmd).encode('utf-8'))
-                    response_data = b""
-                    while True:
-                        chunk = ssock.recv(4096)
-                        if not chunk:
-                            break
-                        response_data += chunk
-                    return json.loads(response_data.decode('utf-8'))
-        except (socket.error, ssl.SSLError, json.JSONDecodeError) as e:
-            logging.error(f"Proxy error: {str(e)}", exc_info=True)
-            raise OSINTClientError(f"Communication error: {str(e)}")
+def send_command(self, command: str, args: Dict = None) -> Dict:
+    try:
+        with socket.create_connection((PROXY_HOST, PROXY_PORT), timeout=TIMEOUT) as sock:
+            with self.context.wrap_socket(sock, server_hostname=PROXY_HOST) as ssock:
+                cert_data = {'cert': self.cert, 'key': self.key, 'ca': self.ca}
+                ssock.send(json.dumps(cert_data).encode('utf-8'))
+                salt = ssock.recv(4096)
+                if not salt:
+                    raise OSINTClientError("Failed to receive encryption salt from proxy")
+                
+                connection_id = hash(str(ssock.getpeercert()))
+                kdf = PBKDF2HMAC(
+                    algorithm=hashes.SHA256(),
+                    length=32,
+                    salt=salt,
+                    iterations=100000,
+                )
+                key = base64.urlsafe_b64encode(kdf.derive(str(connection_id).encode()))
+                cipher = Fernet(key)
+                
+                cmd = {"command": command}
+                if args:
+                    cmd["args"] = args
+                ssock.send(json.dumps(cmd).encode('utf-8'))
+                
+                response_data = b""
+                while True:
+                    chunk = ssock.recv(4096)
+                    if not chunk:
+                        break
+                    response_data += chunk
+                
+                # Decrypt the response
+                decrypted_data = cipher.decrypt(response_data)
+                return json.loads(decrypted_data.decode('utf-8'))
+    except (socket.error, ssl.SSLError, json.JSONDecodeError) as e:
+        logging.error(f"Proxy error: {str(e)}", exc_info=True)
+        raise OSINTClientError(f"Communication error: {str(e)}")
 
 client = OSINTClient()
 
@@ -575,7 +594,7 @@ if __name__ == '__main__':
     import atexit
     atexit.register(lambda: proxy.stop() if hasattr(proxy, 'stop') else None)
     
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8444))
     app.run(
         host='0.0.0.0',
         port=port,

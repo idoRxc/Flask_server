@@ -1,15 +1,14 @@
-import socket 
+import socket
 import threading
 import ssl
 import json
 import time
+import os
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
-import os
 import OpenSSL.crypto
-
 
 class MiddleProxy:
     def __init__(self, server_host, server_port, proxy_host, proxy_port):
@@ -33,6 +32,7 @@ class MiddleProxy:
 
     def fetch_certificates(self):
         try:
+            # Fetch server certificate (Flask Server)
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.connect((self.server_host, self.server_port))
             server_context = ssl.create_default_context()
@@ -40,6 +40,7 @@ class MiddleProxy:
             self.server_certs = server_ssl.getpeercert(binary_form=True)
             server_socket.close()
 
+            # Fetch backend certificate (OSINT Server)
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             client_socket.connect((self.proxy_host, self.proxy_port))
             client_context = ssl.create_default_context()
@@ -65,22 +66,17 @@ class MiddleProxy:
         return Fernet(key), salt
 
     def start(self):
-        if not self.fetch_certificates():
-            raise Exception("Failed to fetch certificates")
-
         self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        if self.server_certs and self.client_certs:
-            self.ssl_context.load_verify_locations(cadata=self.server_certs)
-            self.ssl_context.load_verify_locations(cadata=self.client_certs)
-        
+        cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
+        self.ssl_context.load_cert_chain(certfile=os.path.join(cert_dir, 'server.crt'), keyfile=os.path.join(cert_dir, 'server.key'))
+        self.ssl_context.load_verify_locations(cafile=os.path.join(cert_dir, 'ca.crt'))
         self.ssl_context.verify_mode = ssl.CERT_REQUIRED
         self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_3
         self.ssl_context.set_ciphers(self.cipher_suite)
-        
-        self.ssl_context.options |= ssl.OP_NO_COMPRESSION 
-        self.ssl_context.options |= ssl.OP_SINGLE_DH_USE 
+        self.ssl_context.options |= ssl.OP_NO_COMPRESSION
+        self.ssl_context.options |= ssl.OP_SINGLE_DH_USE
         self.ssl_context.options |= ssl.OP_SINGLE_ECDH_USE
-        
+
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind((self.server_host, self.server_port))
@@ -89,16 +85,18 @@ class MiddleProxy:
 
     def accept_connections(self):
         while True:
-            client_socket, client_address = self.server_socket.accept()
-            print(f"Accepted connection from {client_address}")
-            client_thread = threading.Thread(target=self.handle_client, args=(client_socket,))
-            client_thread.start()
+            try:
+                client_socket, client_address = self.server_socket.accept()
+                print(f"Accepted connection from {client_address}")
+                client_thread = threading.Thread(target=self.handle_client, args=(client_socket,))
+                client_thread.start()
+            except Exception as e:
+                print(f"Error accepting connection: {e}")
 
     def handle_client(self, client_socket):
+        connection_id = None
         try:
             ssl_client = self.ssl_context.wrap_socket(client_socket, server_side=True)
-            
-            # Receive and verify certificates
             cert_data = ssl_client.recv(4096)
             if not self.verify_certificates(cert_data):
                 print("Certificate verification failed")
@@ -113,19 +111,18 @@ class MiddleProxy:
 
             connection_id = hash(str(cert))
             cipher, salt = self.generate_encryption_key(connection_id)
-            
             with self.lock:
                 self.encryption_keys[connection_id] = cipher
 
             ssl_client.send(salt)
             self.handle_backend(ssl_client, cert, connection_id)
-
         except ssl.SSLError as e:
             print(f"SSL Error: {e}")
         except Exception as e:
             print(f"Error handling client: {e}")
         finally:
-            self.cleanup_connection(connection_id)
+            if connection_id:
+                self.cleanup_connection(connection_id)
             client_socket.close()
 
     def verify_certificates(self, cert_data):
@@ -135,32 +132,21 @@ class MiddleProxy:
                 print("Missing required certificate data")
                 return False
 
-            self.session_certs = cert_info
+            cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, cert_info['cert'])
+            ca_cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, cert_info['ca'])
             
-            try:
-                cert = OpenSSL.crypto.load_certificate(
-                    OpenSSL.crypto.FILETYPE_PEM, 
-                    cert_info['cert']
-                )
-                ca_cert = OpenSSL.crypto.load_certificate(
-                    OpenSSL.crypto.FILETYPE_PEM, 
-                    cert_info['ca']
-                )
-                
-                store = OpenSSL.crypto.X509Store()
-                store.add_cert(ca_cert)
-                store_ctx = OpenSSL.crypto.X509StoreContext(store, cert)
-                store_ctx.verify_certificate()
-                
-                print("Certificate verification successful")
-                return True
-                
-            except OpenSSL.crypto.X509StoreContextError as e:
-                print(f"Certificate verification failed: {e}")
-                return False
-                
+            store = OpenSSL.crypto.X509Store()
+            store.add_cert(ca_cert)
+            store_ctx = OpenSSL.crypto.X509StoreContext(store, cert)
+            store_ctx.verify_certificate()
+            
+            print("Certificate verification successful")
+            return True
         except json.JSONDecodeError:
             print("Invalid certificate data format")
+            return False
+        except OpenSSL.crypto.X509StoreContextError as e:
+            print(f"Certificate verification failed: {e}")
             return False
         except Exception as e:
             print(f"Certificate verification error: {e}")
@@ -170,22 +156,17 @@ class MiddleProxy:
         try:
             backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             backend_context = ssl.create_default_context()
-            backend_context.load_verify_locations(cafile='./ca.crt')
-            backend_context.load_cert_chain(certfile='./client.crt', keyfile='./client.key')
+            cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
+            backend_context.load_verify_locations(cafile=os.path.join(cert_dir, 'ca.crt'))
+            backend_context.load_cert_chain(certfile=os.path.join(cert_dir, 'client.crt'), keyfile=os.path.join(cert_dir, 'client.key'))
             backend_context.minimum_version = ssl.TLSVersion.TLSv1_3
             backend_context.set_ciphers(self.cipher_suite)
             
-            backend_ssl = backend_context.wrap_socket(
-                backend_socket,
-                server_hostname=self.proxy_host
-            )
+            backend_ssl = backend_context.wrap_socket(backend_socket, server_hostname=self.proxy_host)
             backend_ssl.connect((self.proxy_host, self.proxy_port))
 
             with self.lock:
-                self.active_connections[connection_id] = {
-                    'client': client_ssl,
-                    'backend': backend_ssl
-                }
+                self.active_connections[connection_id] = {'client': client_ssl, 'backend': backend_ssl}
 
             client_thread = threading.Thread(
                 target=self.relay_data,
@@ -198,10 +179,8 @@ class MiddleProxy:
 
             client_thread.start()
             backend_thread.start()
-
             client_thread.join()
             backend_thread.join()
-
         except Exception as e:
             print(f"Error in backend handling: {e}")
         finally:
@@ -227,25 +206,24 @@ class MiddleProxy:
                 data = source.recv(4096)
                 if not data:
                     break
-
-                if direction == "client->backend":
-                    data = self.encrypt_data(data, connection_id)
-                else:
-                    data = self.decrypt_data(data, connection_id)
+                
+                if self.Id_malicious_traffic(data):
+                    print(f"Blocked malicious traffic in {direction}")
+                    continue
 
                 try:
                     decoded = data.decode('utf-8').strip()
                     json_data = json.loads(decoded)
-                    print(f"{direction} JSON: {json.dumps(json_data, indent=2)}")
+                    print(f"{direction} received: {json.dumps(json_data, indent=2)}")
                 except (json.JSONDecodeError, UnicodeDecodeError):
-                    print(f"{direction} RAW: {len(data)} bytes")
+                    print(f"{direction} received: {len(data)} bytes")
+                    self.handle_other_traffic(data)
 
+                if direction == "backend->client":
+                    data = self.encrypt_data(data, connection_id)
                 destination.send(data)
-
         except Exception as e:
             print(f"Error in {direction}: {e}")
-        finally:
-            self.cleanup_connection(connection_id)
 
     def cleanup_connection(self, connection_id):
         with self.lock:
@@ -270,34 +248,29 @@ class MiddleProxy:
             self.active_connections.clear()
             self.encryption_keys.clear()
         self.server_socket.close()
-    
+
     def log_all_connections(self):
         try:
-            with open('connection_log.txt', 'w') as f:
+            with open('connection_log.txt', 'a') as f:
                 for connection_id, connection in self.active_connections.items():
                     f.write(f"Connection {connection_id}:\n")
                     f.write(f"  Client: {connection['client'].getpeername()}\n")
                     f.write(f"  Backend: {connection['backend'].getpeername()}\n")
-                    f.write(f"  Encryption Key: {self.encryption_keys[connection_id]}\n")
-                    f.write(f"  Client Certificate: {connection['client'].getpeercert()}\n")
-                    f.write(f"  Backend Certificate: {connection['backend'].getpeercert()}\n")
-                    f.write(f"  Client SNI: {connection['client'].getpeername()}\n")
-                    f.write(f"  Backend SNI: {connection['backend'].getpeername()}\n")
-                    f.close()
-            
-            print("All connections logged successfully.")
-
+                    f.write(f"  Encryption Key: {self.encryption_keys.get(connection_id)}\n")
+                    f.write(f"  Client Cert: {connection['client'].getpeercert()}\n")
+                    f.write(f"  Backend Cert: {connection['backend'].getpeercert()}\n\n")
+            print("Connections logged successfully")
         except Exception as e:
             print(f"Error logging connections: {e}")
 
     def shutdown(self):
-        self.server_socket.close()
         self.cleanup()
+        self.server_socket.close()
         print("Proxy server shut down.")
 
     def ping_client_and_backend(self):
         try:
-            for connection_id, connection in self.active_connections.items():
+            for connection_id, connection in list(self.active_connections.items()):
                 client_socket = connection['client']
                 backend_socket = connection['backend']
                 
@@ -308,55 +281,29 @@ class MiddleProxy:
                 backend_response = backend_socket.recv(1024)
 
                 if client_response != b'PONG' or backend_response != b'PONG':
-                    print(f"Connection {connection_id} is not responding.")
+                    print(f"Connection {connection_id} not responding")
                     self.cleanup_connection(connection_id)
-                    self.log_all_connections()
-                    self.shutdown()
-                    break
         except Exception as e:
-            print(f"Error pinging client and backend: {e}") 
-
-
-    def mapping_network_traffic(self):
-        try:
-            while True:
-                data = self.server_socket.recv(4096)
-                if not data:
-                    break
-                
-                if data.startswith(b'GET /'):
-                    self.handle_web_request(data)
-                else:
-                    self.handle_other_traffic(data)
-        except Exception as e:
-            print(f"Error mapping network traffic: {e}")
-        
+            print(f"Error pinging client and backend: {e}")
 
     def Id_malicious_traffic(self, data):
         try:
-            if self.block_malicious_traffic(data):
-                return True
-            return False
+            return self.block_malicious_traffic(data)
         except Exception as e:
             print(f"Error in malicious traffic detection: {e}")
             return False
-            
 
     def block_malicious_traffic(self, data):
         try:
             malicious_patterns = [
-                b'../../../',  
-                b'SELECT',     
-                b'<script',    
-                b'eval(',      
-                b'exec(',      
+                b'../../../', b'SELECT', b'<script', b'eval(', b'exec('
             ]
 
             if isinstance(data, str):
                 data = data.encode()
 
-            for pattern in malicious_patterns:
-                if pattern in data.lower():
+            for pattern in data.lower():
+                if pattern in malicious_patterns:
                     print(f"Blocked malicious traffic containing pattern: {pattern}")
                     return True
 
@@ -365,21 +312,18 @@ class MiddleProxy:
                 return True
 
             current_time = time.time()
-            client_ip = self.server_socket.getpeername()[0]
-            
+            client_ip = self.server_socket.getpeername()[0] if self.server_socket else "unknown"
             if client_ip in self.request_history:
-                if current_time - self.request_history[client_ip] < 1:  # Less than 1 second
+                if current_time - self.request_history[client_ip] < 1:
                     print(f"Blocked potential DoS attack from {client_ip}")
                     return True
-            
             self.request_history[client_ip] = current_time
 
-            return False 
-
+            return False
         except Exception as e:
             print(f"Error in malicious traffic detection: {e}")
             return False
-          
+
     def handle_web_request(self, data):
         try:
             request = data.decode('utf-8')
@@ -387,25 +331,17 @@ class MiddleProxy:
             method, path, protocol = request_line.split()
             print(f"Handling web request: {path}")
 
-            # Check for malicious patterns
             if self.Id_malicious_traffic(data):
                 return None
 
-            # Parse headers
             headers = {}
             for line in request.split('\n')[1:]:
                 if ':' in line:
                     key, value = line.split(':', 1)
                     headers[key.strip()] = value.strip()
 
-            # Log request details
-            print(f"Method: {method}")
-            print(f"Path: {path}") 
-            print(f"Protocol: {protocol}")
-            print(f"Headers: {headers}")
-
+            print(f"Method: {method}, Path: {path}, Protocol: {protocol}, Headers: {headers}")
             return data
-
         except Exception as e:
             print(f"Error handling web request: {e}")
             return None
@@ -413,42 +349,36 @@ class MiddleProxy:
     def handle_other_traffic(self, data):
         try:
             print(f"Handling other traffic: {len(data)} bytes")
-            # Add your other traffic handling logic here
+            try:
+                decoded = data.decode('utf-8').strip()
+                json_data = json.loads(decoded)
+                print(f"Other traffic JSON: {json.dumps(json_data, indent=2)}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                print(f"Other traffic RAW: {data[:100]}...")
+            print("Warning: Unrecognized traffic dropped")
         except Exception as e:
             print(f"Error handling other traffic: {e}")
 
 if __name__ == '__main__':
-    LISTEN_HOST = '0.0.0.0'  
-    LISTEN_PORT = 8443       
-    BACKEND_HOST = 'localhost' 
-    BACKEND_PORT = 8444     
+    LISTEN_HOST = '0.0.0.0'
+    LISTEN_PORT = 8080  # Adjusted to match your system
+    BACKEND_HOST = '127.0.0.1'
+    BACKEND_PORT = 8443
 
-    cert_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'certs')
-    
-    ca_cert = os.path.join(cert_dir, 'ca.crt')
-    client_cert = os.path.join(cert_dir, 'client.crt')
-    client_key = os.path.join(cert_dir, 'client.key')
-
-    for cert_file in [ca_cert, client_cert, client_key]:
+    cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
+    for cert_file in [os.path.join(cert_dir, f) for f in ['ca.crt', 'server.crt', 'server.key', 'client.crt', 'client.key']]:
         if not os.path.exists(cert_file):
             raise FileNotFoundError(f"Certificate file not found: {cert_file}")
 
-    proxy = MiddleProxy(
-        server_host=LISTEN_HOST,
-        server_port=LISTEN_PORT,
-        proxy_host=BACKEND_HOST,
-        proxy_port=BACKEND_PORT
-    )
+    proxy = MiddleProxy(LISTEN_HOST, LISTEN_PORT, BACKEND_HOST, BACKEND_PORT)
     try:
         print("Starting proxy server...")
         print(f"Using certificates from: {cert_dir}")
         proxy.start()
-        print(f"Proxy listening on {LISTEN_HOST}:{LISTEN_PORT}")
-        print(f"Forwarding to {BACKEND_HOST}:{BACKEND_PORT}")
         proxy.accept_connections()
     except KeyboardInterrupt:
         print("\nShutting down proxy server...")
-        proxy.cleanup()
+        proxy.shutdown()
     except Exception as e:
         print(f"Error: {e}")
-        proxy.cleanup()
+        proxy.shutdown()

@@ -38,10 +38,14 @@ logging.basicConfig(
 
 class ContextFilter(logging.Filter):
     def filter(self, record):
-        record.ip = request.remote_addr if request else 'N/A'
-        record.user = request.headers.get('X-User', 'anonymous')
+        try:
+            record.ip = request.remote_addr or 'N/A'
+            record.user = request.headers.get('X-User', 'anonymous')
+        except RuntimeError:
+            record.ip = 'N/A'
+            record.user = 'anonymous'
         return True
-
+    
 logging.getLogger().addFilter(ContextFilter())
 
 # --- Security Setup ---
@@ -299,7 +303,6 @@ def add_security_headers(response):
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     return response
 
-# --- Run Server ---
 if __name__ == '__main__':
     required_vars = ['ENCRYPTION_KEY', 'SENTINEL_API_KEY', 'API_TOKEN', 'CA_CERT_PATH']
     for var in required_vars:
